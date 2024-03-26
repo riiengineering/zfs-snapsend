@@ -189,7 +189,7 @@ zfs_sync_exec() {
 	# zfs_sync_exec dataset options...
 	case ${1-}
 	in
-		(?*:?*/?*)
+		(?*:?*)
 			# remote via SSH
 			__zfs_sync_dest=$1
 			shift
@@ -215,7 +215,7 @@ zfs_sync_exec() {
 
 			ssh "$@"
 			;;
-		(?*/?*)
+		(?*)
 			# local
 			set -- "$@" "$1"
 			shift
@@ -271,11 +271,11 @@ step_syncsnapshots() (
 
 	case ${sync_value-}
 	in
-		(?*:?*/?*)
+		(?*:?*)
 			# remote via SSH
 			# TODO: implement autosnapshot check over SSH
 			;;
-		(?*/?*)
+		(?*)
 			# local
 			case $(autosnapshot_frequency "${sync_value}")
 			in
