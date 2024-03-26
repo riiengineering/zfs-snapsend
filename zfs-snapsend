@@ -1,0 +1,435 @@
+#!/bin/sh
+#
+# zfs-snapsend. simple ZFS snapshotting and replication utility.
+#
+# Copyright (C) 2023-2024 Dennis Camera (dennis.camera at riiengineering.ch)
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+#
+# Help:
+# -----
+#
+# to configure this program, set the following properties on your ZFS datasets:
+#
+# ch.riiengineering:auto-snapshot: [never|hourly|daily|weekly|monthly|yearly]
+#
+#   how often to create a fresh snapshot
+#   (you must run this script at least once an hour for the hourly option
+#    to work etc.)
+#
+# ch.riiengineering:auto-snapshots-keep: [all|n>0]
+#
+#   either keep [all] or the last n snapshots.
+#
+# ch.riiengineering:auto-sync-to: ...
+#
+#   sync snapshots of this dataset to another zpool (either local or via SSH).
+#
+#   for local: zpool/dataset
+#   for remote: [user@]host:zpool/dataset
+#
+#
+# NOTE: all properties are applied _recursively_.
+#
+
+set -e -u
+
+# Configuration
+
+zfsprop_userprefix=ch.riiengineering
+zfsprop_autosnapshot="${zfsprop_userprefix:?}:auto-snapshot"
+zfsprop_keepsnapshots="${zfsprop_userprefix:?}:auto-snapshots-keep"
+zfsprop_sendsnapshots="${zfsprop_userprefix:?}:auto-sync-to"
+
+snapshot_date_format='%Y-%m-%dT%H:%M:%SZ'
+snapshot_date_bre='[0-9]\{4\}\(-[0-9]\{2\}\)\{2\}T\([0-9]\{2\}:\)\{2\}[0-9]\{2\}Z'
+
+if command -v chronic >/dev/null 2>&1 && test "${IN_CHRONIC:+1}"
+then
+	IN_CHRONIC=true exec chronic -ve "$@"
+fi
+
+trap 'exit $((rc))' EXIT
+
+shquot() {
+	# source: https://github.com/riiengineering/shfun/blob/main/lib/quote/shquot.sh
+	sed -e "s/'/'\\\\''/g" -e "1s/^/'/" -e "\$s/\$/'/" <<-EOF
+	$*
+	EOF
+}
+
+error() {
+	# shellcheck disable=SC2059
+	printf "$@" >&2
+	rc=1
+}
+
+autosnapshot_frequency() {
+	# get auto snapshot frequency in iso8601_utc_at() compatible format for a
+	# given ZFS dataset.
+	# prints nothing if no snapshots are to be made.
+	# returns 1 on error.
+
+	__snapshot_value=$(
+		zfs get -H -o value "${zfsprop_autosnapshot:?}" "$1" 2>/dev/null \
+		| LC_ALL=C tr '[:upper:]' '[:lower:]')
+	case ${__snapshot_value}
+	in
+		(''|-|0|no|false|never)
+			;;
+		(hourly)
+			echo 1H ;;
+		(daily)
+			echo 1d ;;
+		(weekly)
+			echo 1w ;;
+		(monthly)
+			echo 1m ;;
+		(yearly)
+			echo 1y ;;
+		(*)
+			error '%s: invalid %s property value: %s\n' \
+				"$1" "${zfsprop_autosnapshot}" "${__snapshot_value}"
+			unset -v __snapshot_value
+			return 1
+		;;
+	esac
+	unset -v __snapshot_value
+}
+
+iso8601_utc_at() {
+	case $(uname -s)
+	in
+		(Linux)
+			# GNU date
+			for _a
+			do
+				case ${_a}
+				in
+					(*y) set -- "$@" "${_a%y} years" ;;
+					(*m) set -- "$@" "${_a%m} months" ;;
+					(*w) set -- "$@" "${_a%w} weeks" ;;
+					(*d) set -- "$@" "${_a%d} days" ;;
+					(*H) set -- "$@" "${_a%H} hours" ;;
+					(*M) set -- "$@" "${_a%M} mins" ;;
+					(*S) set -- "$@" "${_a%S} secs" ;;
+				esac
+				shift
+			done
+			unset -v _a
+
+			# shellcheck disable=SC2048
+			date -u ${*:+-d "$*"} +"${snapshot_date_format:?}"
+			;;
+		(Darwin|FreeBSD)
+			# FreeBSD/Darwin date
+			for _a
+			do
+				set -- "$@" -v"${_a}"
+				shift
+			done
+			unset -v _a
+
+			date -u "$@" +"${snapshot_date_format:?}"
+			;;
+	esac
+}
+
+iso8601_utc_date() { iso8601_utc_at; }
+
+iso8601_ge() {
+	test "${1-}" != "$(printf '%s\n' "$@" | LC_ALL=C sort | head -n 1)"
+}
+
+
+step_autosnapshot() (
+	: "${1:?}"
+
+	autosnap_freq=$(autosnapshot_frequency "${1:?}")
+	case ${autosnap_freq-}
+	in
+		('')
+			# no snapshots
+			;;
+		(*)
+			min_snapshot_name=$(iso8601_utc_at "-${autosnap_freq:?}" '+30M')
+
+			# determine last auto snapshot
+			last_autosnap=$(
+				zfs list -H -t snapshot -o name -S createtxg "${1:?}" \
+				| sed -n -e '/@'"${snapshot_date_bre:?}"'$/{s/^[^@]*@//;p;q;}')
+				# | sed -n -e '/@'"${snapshot_date_bre:?}"'$/h' -e '$''{g;s/^[^@]*@//;p;}')
+
+			if ! iso8601_ge "${last_autosnap}" "${min_snapshot_name}"
+			then
+				_snapname=$(iso8601_utc_date)
+				printf '%s: taking snapshot %s...\n' "${1-}" "${_snapname-}"
+				zfs snapshot "${1:?}@${_snapname:?}" || {
+					error '%s: snapshot %s failed\n' "${1-}" "${_snapname-}" >&2
+					return 1
+				}
+			fi
+			;;
+	esac
+)
+
+zfs_sync_exec() {
+	# zfs_sync_exec dataset options...
+	case ${1-}
+	in
+		(?*:?*/?*)
+			# remote via SSH
+			__zfs_sync_dest=$1
+			shift
+
+			set -- "$@" "${__zfs_sync_dest#*:}"
+			for __zfs_sync_a
+			do
+				case ${__zfs_sync_a}
+				in
+					(''|*[!a-zA-Z0-9!+,./:@^_-]*)
+						set -- "$@" "$(shquot "${__zfs_sync_a}")"
+						;;
+					(*)
+						set -- "$@" "${__zfs_sync_a}"
+						;;
+				esac
+				shift
+			done
+			unset -v __zfs_sync_a
+
+			set -- "${__zfs_sync_dest%%:*}" zfs "$@"
+			unset -v __zfs_sync_dest
+
+			ssh "$@"
+			;;
+		(?*/?*)
+			# local
+			set -- "$@" "$1"
+			shift
+			zfs "$@"
+			;;
+	esac
+}
+
+step_syncsnapshots() (
+	: "${1:?}"
+
+	IFS='	' read -r sync_source sync_value <<-EOF
+	$(LC_ALL=C.UTF-8 zfs get -H -o source,value "${zfsprop_sendsnapshots:?}" "${1:?}")
+	EOF
+	case ${sync_value-}
+	in
+		(''|-)
+			# don’t sync anywhere
+			return 0
+			;;
+	esac
+
+	# handle recursiveness
+	case ${sync_source-}
+	in
+		('inherited from '*)
+			# append to $sync_value the suffix of $1 relative to
+			# $sync_source’s dataset name.
+			# makes sense?
+			__propsource_zds=${sync_source#'inherited from '}
+			__inherit_suffix=${1#"${__propsource_zds:?}"}
+
+			if
+				# assertions
+				test -n "${__inherit_suffix-}" \
+				&& test "${__inherit_suffix#/}" != "${__inherit_suffix-}" \
+				&& test -n "${__propsource_zds}" \
+				&& zfs list -H "${__propsource_zds}" >/dev/null 2>&1
+			then
+				sync_value=${sync_value:?}${__inherit_suffix:?}
+			else
+				# failed to determine suffix in a "secure" way, abort
+				# here to avoid potentially overwriting things we
+				# shouldn’t
+				sync_value=''
+				error '%s: failed to determine sync destination from inherited property value.\n' "${1-}"
+				return 1
+			fi
+
+			unset -v __propsource_zds __inherit_suffix
+			;;
+	esac
+
+	case ${sync_value-}
+	in
+		(?*:?*/?*)
+			# remote via SSH
+			# TODO: implement autosnapshot check over SSH
+			;;
+		(?*/?*)
+			# local
+			case $(autosnapshot_frequency "${sync_value}")
+			in
+				(?*)
+					error '%s: the sync destination (%s) has auto snapshots enabled. This conflicts with syncing. This file system will not be synced.\n' \
+						"${1-}" "${sync_value-}"
+					return 1
+			esac
+			;;
+	esac
+
+	{
+		# determine the last snapshot taken of the source
+		read -r last_snapshot <<-EOF
+		$(zfs list -H -o name -t snapshot -S createtxg "${1:?}")
+		EOF
+		last_snapshot=${last_snapshot#*@}
+
+		case ${last_snapshot-} in (?*)
+			# determine the last snapshot which was synced to the destination
+			last_synced=$(
+				read -r _dest_last_guid <<-EOF
+				$(zfs_sync_exec "${sync_value:?}" list -H -o guid -t snapshot -S createtxg 2>/dev/null)
+				EOF
+
+				# TODO: empty ???
+
+				while read -r _guid _name
+				do
+					case ${_name-} in (*?@?*) ;; (*) continue ;; esac
+
+					case ${_guid-}
+					in
+						("${_dest_last_guid}")
+							echo "${_name#*@}"
+							break
+					esac
+				done <<-EOF
+				$(zfs list -H -o guid,name -t snapshot -S createtxg "${1:?}" 2>/dev/null)
+				EOF
+			)
+
+			case ${last_synced-}
+			in
+				("${last_snapshot}")
+					# nothing to update
+					return 0
+					;;
+			esac
+
+			printf '%s: syncing to %s...\n' "${1-}" "${sync_value-}"
+
+			case ${last_synced-} in ('')
+				# initial sync first snapshot only and then the rest
+				# using the incremental logic following
+				last_synced=$(
+					zfs list -H -o name -t snapshot -s createtxg "${1:?}" 2>/dev/null \
+					| sed -n -e '1s/^[^@]*@//p')
+
+				# auto snapshots are disabled on the initial sync
+				# because they interfere with syncing, also the
+				# destination is made readonly.
+				zfs send "${1:?}"@"${last_synced:?}" \
+				| zfs_sync_exec "${sync_value:?}" receive \
+					-v \
+					-o "${zfsprop_autosnapshot:?}"='never' \
+					-x "${zfsprop_keepsnapshots:?}" \
+					-x "${zfsprop_sendsnapshots:?}"
+			esac
+
+			case ${last_synced-}
+			in
+				('')
+					# no initial sync, cannot incrementally update (what happened above?)
+					;;
+				("${last_snapshot}")
+					# nothing to update (why didn't we abort?)
+					;;
+				(?*)
+					# incremental update
+					zfs send \
+						-I @"${last_synced}" \
+						"${1:?}"@"${last_snapshot:?}" \
+					| zfs_sync_exec "${sync_value:?}" receive \
+						-v \
+						-x "${zfsprop_autosnapshot:?}" \
+						-x "${zfsprop_keepsnapshots:?}" \
+						-x "${zfsprop_sendsnapshots:?}"
+					;;
+			esac
+		esac
+	} || {
+		error '%s: failed to sync to %s\n' "${1-}" "${sync_value-}"
+		return 1
+	}
+)
+
+step_prunesnapshots() (
+	: "${1:?}"
+
+	keep_value=$(zfs get -H -o value "${zfsprop_keepsnapshots:?}" "${1:?}")
+	case ${keep_value-}
+	in
+		(''|-|-1|all)
+			# no pruning
+			;;
+		(0)
+			error '%s: %s is set to 0. This is NOT what you want, as it would delete all snapshots, always.\n' \
+				"${1:?}" "${zfsprop_keepsnapshots:?}"
+			return 1
+			;;
+		(*)
+			if { test $((keep_value)) -gt 0; } 2>/dev/null
+			then
+				# prune old snapshots
+				zfs list -H -t snapshot -s createtxg -o name "${zds:?}" \
+				| grep -e "@${snapshot_date_bre:?}\$" \
+				| head -n -$((keep_value)) \
+				| while read -r _snapname
+				  do
+					  if test -z "${_msg_shown+y}"
+					  then
+						  printf '%s: pruning old snapshots...\n' "${1:?}"
+						  _msg_shown=true
+					  fi
+
+					  zfs destroy -v "${_snapname:?}"
+				  done
+			else
+				error '%s: invalid %s property value: %s\n' \
+					"${1-}" "${zfsprop_keepsnapshots:?}" "${keep_value-}"
+				return 1
+			fi
+			;;
+	esac
+)
+
+
+# iterate over all ZFS datasets and perform the steps as defined by properties
+while read -r zds
+do
+{
+	test -n "${zds}" || continue
+
+	# STEP: auto snapshot
+	step_autosnapshot "${zds}"
+
+	# STEP: send auto snapshots somewhere else
+	step_syncsnapshots "${zds}"
+
+	# STEP: prune old snapshots
+	step_prunesnapshots "${zds}"
+
+} <&- || { rc=1; }  # swallow errors
+done <<EOF
+$(zfs list -H -o name -s name -t filesystem,volume)
+EOF
