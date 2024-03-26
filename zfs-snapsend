@@ -341,6 +341,7 @@ step_syncsnapshots() (
 				zfs send "${1:?}"@"${last_synced:?}" \
 				| zfs_sync_exec "${sync_value:?}" receive \
 					-v \
+					-o readonly=on \
 					-o "${zfsprop_autosnapshot:?}"='never' \
 					-x "${zfsprop_keepsnapshots:?}" \
 					-x "${zfsprop_sendsnapshots:?}" \
