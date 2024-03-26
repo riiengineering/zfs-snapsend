@@ -301,7 +301,7 @@ step_syncsnapshots() (
 				$(zfs_sync_exec "${sync_value:?}" list -H -o guid -t snapshot -S createtxg 2>/dev/null)
 				EOF
 
-				# TODO: empty ???
+				test -n "${_dest_last_guid}" || exit  # break if last guid could not be determined
 
 				while read -r _guid _name
 				do
@@ -343,7 +343,8 @@ step_syncsnapshots() (
 					-v \
 					-o "${zfsprop_autosnapshot:?}"='never' \
 					-x "${zfsprop_keepsnapshots:?}" \
-					-x "${zfsprop_sendsnapshots:?}"
+					-x "${zfsprop_sendsnapshots:?}" \
+				|| return 1
 			esac
 
 			case ${last_synced-}
@@ -363,7 +364,8 @@ step_syncsnapshots() (
 						-v \
 						-x "${zfsprop_autosnapshot:?}" \
 						-x "${zfsprop_keepsnapshots:?}" \
-						-x "${zfsprop_sendsnapshots:?}"
+						-x "${zfsprop_sendsnapshots:?}" \
+					|| return 1
 					;;
 			esac
 		esac
