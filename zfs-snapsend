@@ -56,6 +56,7 @@ zfsprop_sendsnapshots="${zfsprop_userprefix:?}:auto-sync-to"
 snapshot_date_format='%Y-%m-%dT%H:%M:%SZ'
 snapshot_date_bre='[0-9]\{4\}\(-[0-9]\{2\}\)\{2\}T\([0-9]\{2\}:\)\{2\}[0-9]\{2\}Z'
 
+rc=0
 trap 'exit $((rc))' EXIT
 
 shquot() {
@@ -389,9 +390,9 @@ step_prunesnapshots() (
 			if { test $((keep_value)) -gt 0; } 2>/dev/null
 			then
 				# prune old snapshots
-				zfs list -H -t snapshot -s createtxg -o name "${zds:?}" \
+				zfs list -H -t snapshot -S createtxg -o name "${zds:?}" \
 				| grep -e "@${snapshot_date_bre:?}\$" \
-				| head -n -$((keep_value)) \
+				| tail -n +$((keep_value + 1)) \
 				| while read -r _snapname
 				  do
 					  if test -z "${_msg_shown+y}"
